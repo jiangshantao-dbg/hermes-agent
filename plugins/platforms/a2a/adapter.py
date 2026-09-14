@@ -1,7 +1,9 @@
 """A2A inbound adapter: stdlib http.server (daemon thread) serving the Agent Card, /metrics and
 JSON-RPC (message/send, message/stream SSE, tasks/*, push-config CRUD). Inbound tasks are framed
-(security.wrap_inbound) and routed into the LIVE gateway session; ``send()`` fulfils the per-task
-Future the HTTP handler blocks on. No token configured => binds 127.0.0.1 only."""
+(security.wrap_inbound) and routed into the LIVE gateway session. ``message/send`` still waits on
+a per-task Future resolved only by a notify-marked final ``send`` (or processing failure).
+``message/stream`` additionally drains a per-task snapshot queue so WORKING frames carry text.
+No token configured => binds 127.0.0.1 only."""
 
 from __future__ import annotations
 
@@ -21,11 +23,13 @@ from collections import deque
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FuturesTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from queue import Empty, Queue
 from typing import Any, Dict, Optional
+from uuid import uuid4
 
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
-from gateway.config import Platform
+from gateway.config import DEFAULT_STREAMING_CURSOR, Platform
 from gateway.platforms._shared import coerce_port as _to_int, get_scoped_secret as _get_scoped_secret
 
 from . import protocol, security
@@ -291,9 +295,9 @@ class A2AAdapter(BasePlatformAdapter):
         self._profile_sessions: Dict[tuple[str, str, str], str] = {}
         self._profile_session_locks: Dict[tuple[str, str, str], threading.Lock] = {}
         self._profile_session_locks_guard = threading.Lock()
-        # Pending reply futures: task_id -> (context_id, Future). _pending_order keeps per-context
-        # FIFO so adapter.send() — which only knows the context — resolves the oldest task.
-        self._pending: Dict[str, tuple[str, Future]] = {}
+        # Pending replies: task_id -> {context_id, future, events, artifact_id, streamed, last_text}.
+        # _pending_order keeps per-context FIFO so adapter.send() resolves the oldest task.
+        self._pending: Dict[str, dict[str, Any]] = {}
         self._pending_order: Dict[str, deque[str]] = {}
         # Request ownership outlives reply Futures and also covers synchronous profile forwards.
         self._active_tasks: set[str] = set()
@@ -477,9 +481,17 @@ class A2AAdapter(BasePlatformAdapter):
 
     def _add_pending(self, task_id: str, context_id: str) -> Future:
         fut: Future = Future()
+        rec = {
+            "context_id": context_id,
+            "future": fut,
+            "events": Queue(),
+            "artifact_id": uuid4().hex,
+            "streamed": False,
+            "last_text": "",
+        }
         with self._pending_lock:
             self._active_tasks.add(task_id)
-            self._pending[task_id] = (context_id, fut)
+            self._pending[task_id] = rec
             self._pending_order.setdefault(context_id, deque()).append(task_id)
         return fut
 
@@ -491,17 +503,20 @@ class A2AAdapter(BasePlatformAdapter):
         with self._pending_lock:
             self._active_tasks.discard(task_id)
             entry = self._pending.pop(task_id, None)
-            order = self._pending_order.get(entry[0]) if entry else None
+            ctx = entry["context_id"] if entry else None
+            order = self._pending_order.get(ctx) if ctx else None
             if order and task_id in order:
                 order.remove(task_id)
             if order is not None and not order:
-                self._pending_order.pop(entry[0], None)
+                self._pending_order.pop(ctx, None)
 
     def _resolve_locked(self, task_id: str, state: str, text: str) -> bool:
         entry = self._pending.get(task_id)
-        if not entry or entry[1].done():
+        if not entry or entry["future"].done():
             return False
-        entry[1].set_result((state, text))
+        entry["future"].set_result((state, text))
+        # Wake a stream pump blocked on Queue.get.
+        entry["events"].put(None)
         return True
 
     def _resolve_task(self, task_id: str, state: str, text: str) -> bool:
@@ -511,6 +526,47 @@ class A2AAdapter(BasePlatformAdapter):
     def _resolve_oldest_for_context(self, context_id: str, state: str, text: str) -> bool:
         with self._pending_lock:
             return any(self._resolve_locked(tid, state, text) for tid in self._pending_order.get(context_id, ()))
+
+    def _oldest_open_task(self, context_id: str) -> Optional[str]:
+        with self._pending_lock:
+            for tid in self._pending_order.get(context_id, ()):
+                rec = self._pending.get(tid)
+                if rec and not rec["future"].done():
+                    return tid
+        return None
+
+    @staticmethod
+    def _prepare_outbound_text(text: str) -> str:
+        raw = text or ""
+        cursor = DEFAULT_STREAMING_CURSOR
+        if cursor and raw.endswith(cursor):
+            raw = raw[: -len(cursor)]
+        raw = raw.replace("▉", "")
+        return security.redact_outbound(raw)
+
+    def _enqueue_snapshot(self, task_id: str, text: str, *, last_chunk: bool = False) -> bool:
+        """Queue a replace-snapshot artifactUpdate for ``task_id``. Empty text is skipped
+        unless this is the last chunk of an already-streamed artifact."""
+        if not text and not last_chunk:
+            return False
+        with self._pending_lock:
+            rec = self._pending.get(task_id)
+            if not rec or rec["future"].done():
+                return False
+            artifact_id = rec["artifact_id"]
+            context_id = rec["context_id"]
+            q = rec["events"]
+            rec["streamed"] = True
+            rec["last_text"] = text
+        q.put(protocol.artifact_update(
+            task_id, context_id, text, artifact_id=artifact_id, last_chunk=last_chunk,
+        ))
+        return True
+
+    def _pending_stream_state(self, task_id: str) -> tuple[bool, str]:
+        with self._pending_lock:
+            rec = self._pending.get(task_id) or {}
+            return bool(rec.get("streamed")), str(rec.get("artifact_id") or "")
 
     def _scope_for_agent(self, agent: Optional[dict]) -> tuple[str, str]:
         return tuple(str((agent or self._agents[""]).get(k) or "") for k in ("slug", "tenant"))
@@ -658,6 +714,53 @@ class A2AAdapter(BasePlatformAdapter):
         return self._await_future(pending["future"], pending["started"] + _reply_timeout(), keepalive,
                                   (protocol.STATE_FAILED, "[agent did not reply in time]"))
 
+    def _pump_stream_events(self, handler, pending: dict, req_id: Any) -> tuple[str, str]:
+        """Write queued snapshot frames until the reply Future resolves, then drain leftovers."""
+        task_id = pending["task_id"]
+        deadline = pending["started"] + _reply_timeout()
+        timeout_result = (protocol.STATE_FAILED, "[agent did not reply in time]")
+        disconnected = (protocol.STATE_FAILED, "[client disconnected]")
+        while True:
+            rec = None
+            with self._pending_lock:
+                rec = self._pending.get(task_id)
+            if rec is None:
+                break
+            fut, q = rec["future"], rec["events"]
+            if fut.done() and q.empty():
+                break
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return timeout_result
+            wait = min(_SSE_KEEPALIVE, remaining)
+            try:
+                ev = q.get(timeout=wait)
+            except Empty:
+                if time.time() >= deadline:
+                    return timeout_result
+                if fut.done():
+                    continue
+                try:
+                    self._sse_write(handler, ": keepalive\n\n")
+                except Exception:
+                    return disconnected
+                continue
+            if ev is None:
+                continue
+            try:
+                self._sse_write(handler, protocol.sse_data(ev, req_id))
+            except Exception:
+                return disconnected
+        rec = None
+        with self._pending_lock:
+            rec = self._pending.get(task_id)
+        if rec is not None and rec["future"].done():
+            try:
+                return rec["future"].result(timeout=0)
+            except Exception:
+                return timeout_result
+        return timeout_result
+
     def _rpc_message_send(self, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None, v1_response: bool = False) -> dict:
         task, pending = self._prepare_task(params, peer, agent=agent)
         if task is None:
@@ -682,12 +785,17 @@ class A2AAdapter(BasePlatformAdapter):
     def _keepalive(cls, handler):
         return lambda: cls._sse_write(handler, ": keepalive\n\n")
 
-    def _emit_terminal(self, handler, task_id: str, context_id: str, state: str, reply: str, req_id: Any = None) -> None:
+    def _emit_terminal(self, handler, task_id: str, context_id: str, state: str, reply: str,
+                       req_id: Any = None, *, skip_artifact: bool = False, artifact_id: str = "") -> None:
         """Emit the final artifact/status events and the closure marker. ``req_id`` threads into the
-        JSON-RPC SSE envelope (§9.4)."""
+        JSON-RPC SSE envelope (§9.4). Skip the artifact when snapshots already went out on this stream."""
         completed = bool(reply) and state == protocol.STATE_COMPLETED
-        events = ([protocol.artifact_update(task_id, context_id, reply)] if completed else []) + [
-            protocol.status_update(task_id, context_id, state, "" if completed else reply)]
+        events = []
+        if completed and not skip_artifact:
+            events.append(protocol.artifact_update(
+                task_id, context_id, reply, artifact_id=artifact_id, last_chunk=True,
+            ))
+        events.append(protocol.status_update(task_id, context_id, state, "" if completed else reply))
         for ev in events:
             self._sse_write(handler, protocol.sse_data(ev, req_id))
         self._sse_write(handler, protocol.sse_done())
@@ -706,9 +814,12 @@ class A2AAdapter(BasePlatformAdapter):
             submitted = protocol.build_task(task_id, context_id, protocol.STATE_SUBMITTED, created_at=pending["created_iso"])
             self._sse_write(handler, protocol.sse_data(protocol.stream_task(submitted), req_id))
             self._sse_write(handler, protocol.sse_data(protocol.status_update(task_id, context_id, protocol.STATE_WORKING), req_id))
-            state, reply = self._finalize_task(pending, *self._await_reply(pending, keepalive=self._keepalive(handler)))
+            state, reply = self._pump_stream_events(handler, pending, req_id)
+            streamed, artifact_id = self._pending_stream_state(task_id)
+            state, reply = self._finalize_task(pending, state, reply)
             pending = None
-            self._emit_terminal(handler, task_id, context_id, state, reply, req_id=req_id)
+            self._emit_terminal(handler, task_id, context_id, state, reply, req_id=req_id,
+                                skip_artifact=streamed, artifact_id=artifact_id)
         except (BrokenPipeError, ConnectionResetError):
             if pending is not None:
                 self._finalize_task(pending, protocol.STATE_FAILED, "[client disconnected]")
@@ -824,14 +935,32 @@ class A2AAdapter(BasePlatformAdapter):
         logger.debug("A2A: push notification sent for task %s", task_id)
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None):
-        """Fulfil the oldest pending reply Future for this context (``chat_id`` = A2A context id).
-        Only sends carrying ``metadata['notify']`` (the base adapter's final-reply marker) satisfy
-        the caller; progress/status/preview sends must not."""
-        if not (metadata or {}).get("notify"):
-            logger.debug("A2A: ignoring non-final send for context %s", chat_id)
-        elif not self._resolve_oldest_for_context(chat_id, protocol.STATE_COMPLETED, content or ""):
-            logger.debug("A2A: send() for context %s had no pending waiter", chat_id)  # late chunk / out-of-band
-        return SendResult(success=True, message_id=str(int(time.time() * 1000)))
+        """Push a snapshot for the oldest open task in this context (``chat_id`` = A2A context id).
+        Only ``metadata['notify']`` resolves the JSON-RPC Future; interim sends still stream."""
+        text = self._prepare_outbound_text(content or "")
+        notify = bool((metadata or {}).get("notify"))
+        task_id = self._oldest_open_task(chat_id)
+        if task_id:
+            self._enqueue_snapshot(task_id, text, last_chunk=notify)
+            if notify and not self._resolve_oldest_for_context(chat_id, protocol.STATE_COMPLETED, text):
+                logger.debug("A2A: send() for context %s had no pending waiter", chat_id)
+        elif notify:
+            logger.debug("A2A: send() for context %s had no pending waiter", chat_id)
+        return SendResult(success=True, message_id=task_id or str(int(time.time() * 1000)))
+
+    async def edit_message(
+        self, chat_id: str, message_id: str, content: str, *, finalize: bool = False,
+    ) -> SendResult:
+        """Replace the in-flight artifact snapshot. ``finalize`` is lastChunk + resolve."""
+        text = self._prepare_outbound_text(content or "")
+        task_id = str(message_id or "").strip() or self._oldest_open_task(chat_id) or ""
+        if not task_id:
+            return SendResult(success=False, error="Not supported")
+        if not self._enqueue_snapshot(task_id, text, last_chunk=finalize):
+            return SendResult(success=False, error="Not supported")
+        if finalize:
+            self._resolve_task(task_id, protocol.STATE_COMPLETED, text)
+        return SendResult(success=True, message_id=task_id)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         return None
@@ -843,8 +972,17 @@ class A2AAdapter(BasePlatformAdapter):
         """Resolve the task future when processing ends without a reply send (failures,
         cancellations, empty runs) so the HTTP thread returns promptly."""
         task_id = str(getattr(event, "message_id", "") or "")
-        if task_id:
-            self._resolve_task(task_id, *{
-                ProcessingOutcome.FAILURE: (protocol.STATE_FAILED, "[agent processing failed]"),
-                ProcessingOutcome.CANCELLED: (protocol.STATE_CANCELED, ""),
-            }.get(outcome, (protocol.STATE_COMPLETED, "")))
+        if not task_id:
+            return
+        if outcome == ProcessingOutcome.FAILURE:
+            self._resolve_task(task_id, protocol.STATE_FAILED, "[agent processing failed]")
+            return
+        if outcome == ProcessingOutcome.CANCELLED:
+            self._resolve_task(task_id, protocol.STATE_CANCELED, "")
+            return
+        last = ""
+        with self._pending_lock:
+            rec = self._pending.get(task_id)
+            if rec:
+                last = rec.get("last_text") or ""
+        self._resolve_task(task_id, protocol.STATE_COMPLETED, last)

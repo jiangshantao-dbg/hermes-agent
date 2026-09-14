@@ -17,6 +17,7 @@ import re
 import os
 import socket
 import threading
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import Future
@@ -1641,6 +1642,320 @@ print('fake reply')
         title = con.execute("SELECT title FROM sessions WHERE id='sess-1'").fetchone()[0]
         con.close()
         assert title == "a2a-dev-ctx-unsafe-value"
+
+
+# --------------------------------------------------------------------------
+# Inbound streaming snapshots (CAAS-11631) — not @pytest.mark.integration
+# --------------------------------------------------------------------------
+
+class _SseCapture:
+    """Minimal handler stand-in: captures SSE writes without a real socket."""
+
+    def __init__(self):
+        self._chunks: list[bytes] = []
+        self._lock = threading.Lock()
+        cap = self
+
+        class _W:
+            def write(_self, b):
+                data = b if isinstance(b, (bytes, bytearray)) else str(b).encode()
+                with cap._lock:
+                    cap._chunks.append(bytes(data))
+
+            def flush(_self):
+                return None
+
+        self.wfile = _W()
+        self.close_connection = False
+
+    def send_response(self, _code):
+        return None
+
+    def send_header(self, _k, _v):
+        return None
+
+    def end_headers(self):
+        return None
+
+    def raw(self) -> str:
+        with self._lock:
+            return b"".join(self._chunks).decode("utf-8", "replace")
+
+
+def _sse_results(raw: str) -> list[dict]:
+    payloads: list[dict] = []
+    for block in raw.split("\n\n"):
+        for line in block.splitlines():
+            if not line.startswith("data: "):
+                continue
+            obj = json.loads(line[6:])
+            if isinstance(obj, dict) and "result" in obj and isinstance(obj["result"], dict):
+                payloads.append(obj["result"])
+            elif isinstance(obj, dict):
+                payloads.append(obj)
+    return payloads
+
+
+def _artifact_frames(payloads: list[dict]) -> list[tuple[str, str, bool]]:
+    frames = []
+    for p in payloads:
+        au = p.get("artifactUpdate")
+        if not isinstance(au, dict):
+            continue
+        art = au.get("artifact") or {}
+        frames.append((
+            str(art.get("artifactId") or ""),
+            protocol.extract_text(art),
+            bool(au.get("lastChunk")),
+        ))
+    return frames
+
+
+def _status_states(payloads: list[dict]) -> list[str]:
+    return [
+        p["statusUpdate"]["status"]["state"]
+        for p in payloads
+        if isinstance(p.get("statusUpdate"), dict)
+    ]
+
+
+class TestInboundStreamingSnapshots:
+    def _run_loop(self, adapter):
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        adapter._loop = loop
+        adapter._message_handler = object()
+        return loop, thread
+
+    def _stop_loop(self, loop, thread):
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+
+    def _stream(self, adapter, handler, ctx: str, text: str = "stream me"):
+        params = {"message": protocol.text_message(protocol.ROLE_USER, text, context_id=ctx)}
+        adapter._rpc_message_stream(handler, "1", params, "peer")
+
+    def test_stream_emits_snapshot_before_notify(self):
+        adapter = _bare_adapter()
+        loop, loop_thread = self._run_loop(adapter)
+        hel_sent = threading.Event()
+        release_final = threading.Event()
+
+        async def fake_handle(event):
+            await adapter.send(event.source.chat_id, "Hel", metadata={"expect_edits": True})
+            hel_sent.set()
+            assert release_final.wait(timeout=5)
+            await adapter.send(event.source.chat_id, "Hello", metadata={"notify": True})
+
+        adapter.handle_message = fake_handle  # type: ignore
+        handler = _SseCapture()
+        worker = threading.Thread(
+            target=self._stream, args=(adapter, handler, "ctx-snap"), daemon=True,
+        )
+        try:
+            worker.start()
+            assert hel_sent.wait(timeout=5)
+            deadline = time.time() + 5
+            saw_hel = False
+            while time.time() < deadline:
+                frames = _artifact_frames(_sse_results(handler.raw()))
+                if any(text == "Hel" for _aid, text, _last in frames):
+                    saw_hel = True
+                    break
+                time.sleep(0.02)
+            assert saw_hel
+            assert worker.is_alive()
+            release_final.set()
+            worker.join(timeout=5)
+            assert not worker.is_alive()
+            frames = _artifact_frames(_sse_results(handler.raw()))
+            assert frames
+            assert frames[-1][1] == "Hello"
+            assert "TASK_STATE_COMPLETED" in _status_states(_sse_results(handler.raw()))
+        finally:
+            release_final.set()
+            worker.join(timeout=2)
+            self._stop_loop(loop, loop_thread)
+
+    def test_message_send_result_is_notify_payload(self):
+        adapter = _bare_adapter()
+        loop, loop_thread = self._run_loop(adapter)
+
+        async def fake_handle(event):
+            await adapter.send(event.source.chat_id, "Hel", metadata={"expect_edits": True})
+            await adapter.send(event.source.chat_id, "Hello", metadata={"notify": True})
+
+        adapter.handle_message = fake_handle  # type: ignore
+        try:
+            params = {"message": protocol.text_message(protocol.ROLE_USER, "ping", context_id="ctx-send")}
+            resp = adapter._rpc_message_send("1", params, "peer")
+            task = protocol.unwrap_send_message_response(resp["result"])
+            assert protocol.extract_text(task.get("status", {}).get("message") or {}) == "Hello"
+            artifacts = task.get("artifacts") or []
+            assert artifacts
+            assert protocol.extract_text(artifacts[0]) == "Hello"
+        finally:
+            self._stop_loop(loop, loop_thread)
+
+    def test_edit_message_pushes_same_artifact_snapshot(self):
+        adapter = _bare_adapter()
+        loop, loop_thread = self._run_loop(adapter)
+        hel_sent = threading.Event()
+        release_final = threading.Event()
+        sent_id = {"value": ""}
+
+        async def fake_handle(event):
+            result = await adapter.send(event.source.chat_id, "Hel", metadata={"expect_edits": True})
+            sent_id["value"] = result.message_id or ""
+            hel_sent.set()
+            assert release_final.wait(timeout=5)
+            await adapter.send(event.source.chat_id, "Hello", metadata={"notify": True})
+
+        adapter.handle_message = fake_handle  # type: ignore
+        handler = _SseCapture()
+        worker = threading.Thread(
+            target=self._stream, args=(adapter, handler, "ctx-edit"), daemon=True,
+        )
+        try:
+            worker.start()
+            assert hel_sent.wait(timeout=5)
+            deadline = time.time() + 5
+            first_id = ""
+            while time.time() < deadline:
+                frames = _artifact_frames(_sse_results(handler.raw()))
+                if frames and frames[0][1] == "Hel":
+                    first_id = frames[0][0]
+                    break
+                time.sleep(0.02)
+            assert first_id
+            assert sent_id["value"]
+            fut = None
+            with adapter._pending_lock:
+                rec = adapter._pending.get(sent_id["value"])
+                if rec:
+                    fut = rec["future"]
+            edited = asyncio.run(adapter.edit_message(
+                "ctx-edit", sent_id["value"], "Hello there",
+            ))
+            assert edited.success is True
+            if fut is not None:
+                assert fut.done() is False
+            deadline = time.time() + 5
+            saw_edit = False
+            while time.time() < deadline:
+                frames = _artifact_frames(_sse_results(handler.raw()))
+                if any(aid == first_id and text == "Hello there" for aid, text, _last in frames):
+                    saw_edit = True
+                    break
+                time.sleep(0.02)
+            assert saw_edit
+            ids = {aid for aid, _text, _last in _artifact_frames(_sse_results(handler.raw()))}
+            assert ids == {first_id}
+            release_final.set()
+            worker.join(timeout=5)
+        finally:
+            release_final.set()
+            worker.join(timeout=2)
+            self._stop_loop(loop, loop_thread)
+
+    def test_stream_final_does_not_duplicate_artifact_text(self):
+        adapter = _bare_adapter()
+        loop, loop_thread = self._run_loop(adapter)
+
+        async def fake_handle(event):
+            await adapter.send(event.source.chat_id, "Hello", metadata={"expect_edits": True})
+            await adapter.send(event.source.chat_id, "Hello", metadata={"notify": True})
+
+        adapter.handle_message = fake_handle  # type: ignore
+        handler = _SseCapture()
+        try:
+            self._stream(adapter, handler, "ctx-dedupe")
+            frames = _artifact_frames(_sse_results(handler.raw()))
+            assert frames
+            ids = {aid for aid, _text, _last in frames}
+            assert len(ids) == 1
+            merged = ""
+            for _aid, text, _last in frames:
+                if not merged:
+                    merged = text
+                elif text.startswith(merged):
+                    merged = text
+                elif merged.startswith(text):
+                    pass
+                else:
+                    merged = merged + text
+            assert merged == "Hello"
+            assert merged != "HelloHello"
+            assert frames[-1][1] == "Hello"
+        finally:
+            self._stop_loop(loop, loop_thread)
+
+    def test_interim_stream_redacts_and_strips_cursor(self):
+        adapter = _bare_adapter()
+        loop, loop_thread = self._run_loop(adapter)
+        interim_sent = threading.Event()
+        release_final = threading.Event()
+        secret = "sk-abcdefghijklmnopqrstuvwxyz"
+        payload = f"contact a@b.com then {secret} ▉"
+
+        async def fake_handle(event):
+            await adapter.send(event.source.chat_id, payload, metadata={"expect_edits": True})
+            interim_sent.set()
+            assert release_final.wait(timeout=5)
+            await adapter.send(event.source.chat_id, "done", metadata={"notify": True})
+
+        adapter.handle_message = fake_handle  # type: ignore
+        handler = _SseCapture()
+        worker = threading.Thread(
+            target=self._stream, args=(adapter, handler, "ctx-redact"), daemon=True,
+        )
+        try:
+            worker.start()
+            assert interim_sent.wait(timeout=5)
+            deadline = time.time() + 5
+            snapshot = ""
+            while time.time() < deadline:
+                frames = _artifact_frames(_sse_results(handler.raw()))
+                if frames:
+                    snapshot = frames[0][1]
+                    break
+                time.sleep(0.02)
+            assert snapshot
+            assert secret not in snapshot
+            assert "a@b.com" not in snapshot
+            assert "▉" not in snapshot
+            assert snapshot == security.redact_outbound(
+                "contact a@b.com then " + secret,
+            )
+            release_final.set()
+            worker.join(timeout=5)
+        finally:
+            release_final.set()
+            worker.join(timeout=2)
+            self._stop_loop(loop, loop_thread)
+
+    def test_stream_failure_closes_without_notify(self):
+        from gateway.platforms.event import ProcessingOutcome
+
+        adapter = _bare_adapter()
+        loop, loop_thread = self._run_loop(adapter)
+
+        async def fake_handle(event):
+            await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+        adapter.handle_message = fake_handle  # type: ignore
+        handler = _SseCapture()
+        started = time.time()
+        try:
+            self._stream(adapter, handler, "ctx-fail")
+            elapsed = time.time() - started
+            assert elapsed < 30
+            states = _status_states(_sse_results(handler.raw()))
+            assert "TASK_STATE_FAILED" in states
+            assert handler.raw().rstrip().endswith(": done") or ": done\n" in handler.raw()
+        finally:
+            self._stop_loop(loop, loop_thread)
 
 
 # --------------------------------------------------------------------------

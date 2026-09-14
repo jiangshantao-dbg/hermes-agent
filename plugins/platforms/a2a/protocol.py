@@ -201,10 +201,32 @@ def status_update(task_id: str, context_id: str, state: str, text: str = "") -> 
     return {"statusUpdate": {"taskId": task_id, "contextId": context_id, "status": status}}
 
 
-def artifact_update(task_id: str, context_id: str, text: str) -> dict:
-    """v1.0 StreamResponse with an artifactUpdate member."""
-    artifact = {"artifactId": uuid.uuid4().hex, "parts": [text_part(text)]}
-    return {"artifactUpdate": {"taskId": task_id, "contextId": context_id, "artifact": artifact}}
+def artifact_update(
+    task_id: str,
+    context_id: str,
+    text: str,
+    *,
+    artifact_id: str = "",
+    last_chunk: bool = False,
+) -> dict:
+    """v1.0 StreamResponse with an artifactUpdate member.
+
+    ``append`` is omitted (spec default false = replace). Pass a stable
+    ``artifact_id`` so streaming snapshots replace one artifact instead of
+    creating a new one per frame.
+    """
+    artifact = {
+        "artifactId": artifact_id or uuid.uuid4().hex,
+        "parts": [text_part(text)],
+    }
+    update: dict[str, Any] = {
+        "taskId": task_id,
+        "contextId": context_id,
+        "artifact": artifact,
+    }
+    if last_chunk:
+        update["lastChunk"] = True
+    return {"artifactUpdate": update}
 
 
 def sse_data(payload: dict, req_id: Any = None) -> str:
