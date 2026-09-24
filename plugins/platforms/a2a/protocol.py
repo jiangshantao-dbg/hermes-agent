@@ -182,14 +182,14 @@ def extract_context_id(params: dict) -> str:
     return (str(msg.get("contextId") or "") if isinstance(msg, dict) else "") or str(params.get("contextId") or "")
 
 
-def build_task(task_id: str, context_id: str, state: str, agent_text: str = "", *, created_at: str = "") -> dict:
+def build_task(task_id: str, context_id: str, state: str, agent_text: str = "", *, created_at: str = "", artifact_id: str = "") -> dict:
     """A2A v1.0 Task. ``created_at`` is accepted but NOT serialized: the v1.0 Task proto has no
     createdAt and strict ProtoJSON parsers (a2a-sdk) reject unknown fields."""
     task: dict[str, Any] = {"id": task_id, "contextId": context_id, "status": {"state": state, "timestamp": now_iso()}}
     if agent_text:
         task["status"]["message"] = text_message(ROLE_AGENT, agent_text, context_id)
         if state == STATE_COMPLETED:
-            task["artifacts"] = [{"artifactId": uuid.uuid4().hex, "parts": [text_part(agent_text)]}]
+            task["artifacts"] = [{"artifactId": artifact_id or uuid.uuid4().hex, "parts": [text_part(agent_text)]}]
     return task
 
 
@@ -201,10 +201,22 @@ def status_update(task_id: str, context_id: str, state: str, text: str = "") -> 
     return {"statusUpdate": {"taskId": task_id, "contextId": context_id, "status": status}}
 
 
-def artifact_update(task_id: str, context_id: str, text: str) -> dict:
-    """v1.0 StreamResponse with an artifactUpdate member."""
-    artifact = {"artifactId": uuid.uuid4().hex, "parts": [text_part(text)]}
-    return {"artifactUpdate": {"taskId": task_id, "contextId": context_id, "artifact": artifact}}
+def artifact_update(
+    task_id: str, context_id: str, text: str, *, artifact_id: str = "", last_chunk: bool = False,
+) -> dict:
+    """v1.0 StreamResponse：同一个 artifactId 的全文替换。
+
+    proto 里 ``append`` 默认 false，表示替换而不是拼接。这里显式写出，避免只把
+    parts 拼起来的客户端把每一帧快照叠成 HelloHello。``lastChunk`` 只在最终帧为 true。
+    """
+    update: dict[str, Any] = {
+        "taskId": task_id,
+        "contextId": context_id,
+        "append": False,
+        "lastChunk": bool(last_chunk),
+        "artifact": {"artifactId": artifact_id or uuid.uuid4().hex, "parts": [text_part(text)]},
+    }
+    return {"artifactUpdate": update}
 
 
 def sse_data(payload: dict, req_id: Any = None) -> str:
@@ -323,7 +335,8 @@ class TaskStore:
 
     def create(self, task_id: str, context_id: str, peer: str, agent_slug: str = "", tenant: str = "") -> dict:
         rec = {"task_id": task_id, "context_id": context_id, "peer": peer, "agent_slug": agent_slug or "", "tenant": tenant or "",
-               "state": STATE_SUBMITTED, "reply": "", "created_at": time.time(), "created_iso": now_iso(), "push_url": "", "push_config_id": ""}
+               "state": STATE_SUBMITTED, "reply": "", "artifact_id": "", "artifact_text": "",
+               "created_at": time.time(), "created_iso": now_iso(), "push_url": "", "push_config_id": ""}
         with self._lock:
             self._tasks[task_id] = rec
         return dict(rec)
@@ -367,12 +380,25 @@ class TaskStore:
         with self._lock:
             return dict(rec) if (rec := self._scoped(task_id, agent_slug, tenant)) else None
 
+    def set_artifact(self, task_id: str, artifact_id: str, text: str) -> None:
+        """记录当前全文快照。不改变任务状态，供 tasks/get 和后加入的订阅回放。"""
+        with self._lock:
+            rec = self._tasks.get(task_id)
+            if not rec or rec["state"] in TERMINAL_STATES:
+                return
+            rec["artifact_id"] = artifact_id
+            rec["artifact_text"] = text
+
     def complete(self, task_id: str, state: str, reply: str = "") -> Optional[dict]:
         """Transition a task to a terminal state. Idempotent."""
         with self._lock:
             rec = self._tasks.get(task_id)
             if not rec or rec["state"] in TERMINAL_STATES:
                 return None
+            # 失败/取消的 reply 是状态说明，不能覆盖成 artifact。完成时才把最终回复写成同一条快照。
+            if state == STATE_COMPLETED and reply:
+                rec["artifact_text"] = reply
+                rec["artifact_id"] = rec.get("artifact_id") or uuid.uuid4().hex
             rec.update(state=state, reply=reply, completed_at=time.time())
             watchers = self._watchers.pop(task_id, [])
             self._trim_locked()
@@ -422,10 +448,21 @@ class TaskStore:
 
     @staticmethod
     def to_task(rec: dict, include_artifacts: bool = True) -> dict:
-        """Render a stored record as an A2A v1.0 Task."""
-        task = build_task(rec["task_id"], rec["context_id"], rec["state"], rec.get("reply", ""),
-                          created_at=rec.get("created_iso", ""))
-        if not include_artifacts:
+        """Render a stored record as an A2A v1.0 Task.
+
+        终态的 status.message 仍是最终回复。进行中的全文只放在 artifact 上，
+        这样 tasks/get 能看到同一份替换快照，又不会把半成品说成已经完成。
+        """
+        terminal = rec.get("state") in TERMINAL_STATES
+        artifact_id = str(rec.get("artifact_id") or "")
+        artifact_text = str(rec.get("artifact_text") or "")
+        task = build_task(
+            rec["task_id"], rec["context_id"], rec["state"], rec.get("reply", "") if terminal else "",
+            created_at=rec.get("created_iso", ""), artifact_id=artifact_id,
+        )
+        if include_artifacts and artifact_text:
+            task["artifacts"] = [{"artifactId": artifact_id or uuid.uuid4().hex, "parts": [text_part(artifact_text)]}]
+        elif not include_artifacts:
             task.pop("artifacts", None)
         return task
 

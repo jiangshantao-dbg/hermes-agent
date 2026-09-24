@@ -342,6 +342,32 @@ class TestV1Task:
         assert "createdAt" not in task
         assert "lastModified" not in task
 
+    def test_artifact_update_is_explicit_replace(self):
+        frame = protocol.artifact_update("t", "c", "Hel", artifact_id="art-1", last_chunk=False)
+        update = frame["artifactUpdate"]
+        assert update["append"] is False
+        assert update["lastChunk"] is False
+        assert update["artifact"]["artifactId"] == "art-1"
+        assert protocol.extract_text(update["artifact"]) == "Hel"
+        done = protocol.artifact_update("t", "c", "Hello", artifact_id="art-1", last_chunk=True)
+        assert done["artifactUpdate"]["lastChunk"] is True
+        assert done["artifactUpdate"]["artifact"]["artifactId"] == "art-1"
+
+    def test_working_task_keeps_stable_partial_artifact(self):
+        store = protocol.TaskStore()
+        store.create("task-1", "ctx", "peer")
+        store.set_artifact("task-1", "art-1", "Hel")
+        task = protocol.TaskStore.to_task(store.get("task-1"))
+        assert task["status"]["state"] == protocol.STATE_SUBMITTED
+        assert "message" not in task["status"]
+        assert task["artifacts"][0]["artifactId"] == "art-1"
+        assert protocol.extract_text(task["artifacts"][0]) == "Hel"
+        store.complete("task-1", protocol.STATE_COMPLETED, "Hello")
+        done = protocol.TaskStore.to_task(store.get("task-1"))
+        assert done["artifacts"][0]["artifactId"] == "art-1"
+        assert protocol.extract_text(done["artifacts"][0]) == "Hello"
+        assert protocol.extract_text(done["status"]["message"]) == "Hello"
+
     def test_failed_task_has_message_no_artifacts(self):
         task = protocol.build_task("t2", "c2", protocol.STATE_FAILED, "went wrong")
         assert task["status"]["state"] == "TASK_STATE_FAILED"
