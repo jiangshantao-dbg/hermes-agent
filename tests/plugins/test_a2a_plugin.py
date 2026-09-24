@@ -17,6 +17,7 @@ import re
 import os
 import socket
 import threading
+import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -1698,3 +1699,332 @@ def test_load_conversation_skips_non_dict_lines(monkeypatch, tmp_path):
         f.write("42\n")
     convo = protocol.load_conversation("ctx-mixed")
     assert len(convo) == 1 and convo[0]["text"] == "hello"
+
+
+# --------------------------------------------------------------------------
+# Inbound streaming snapshots. Heartbeats stay off the artifact; subscribe and
+# tasks/get see the same replace-snapshot as message/stream.
+# --------------------------------------------------------------------------
+
+
+class _SseCapture:
+    def __init__(self):
+        self._chunks: list[bytes] = []
+        self._lock = threading.Lock()
+        cap = self
+
+        class _W:
+            def write(_self, data):
+                raw = data if isinstance(data, (bytes, bytearray)) else str(data).encode()
+                with cap._lock:
+                    cap._chunks.append(bytes(raw))
+
+            def flush(_self):
+                return None
+
+        self.wfile = _W()
+        self.close_connection = False
+
+    def send_response(self, _code):
+        return None
+
+    def send_header(self, _key, _value):
+        return None
+
+    def end_headers(self):
+        return None
+
+    def raw(self) -> str:
+        with self._lock:
+            return b"".join(self._chunks).decode("utf-8", "replace")
+
+
+def _sse_results(raw: str) -> list[dict]:
+    payloads: list[dict] = []
+    for block in raw.split("\n\n"):
+        for line in block.splitlines():
+            if not line.startswith("data: "):
+                continue
+            obj = json.loads(line[6:])
+            result = obj.get("result") if isinstance(obj, dict) else None
+            payloads.append(result if isinstance(result, dict) else obj)
+    return payloads
+
+
+def _artifact_frames(payloads: list[dict]) -> list[tuple[str, str, bool, bool]]:
+    frames = []
+    for payload in payloads:
+        update = payload.get("artifactUpdate")
+        if not isinstance(update, dict):
+            continue
+        artifact = update.get("artifact") or {}
+        frames.append((
+            str(artifact.get("artifactId") or ""),
+            protocol.extract_text(artifact),
+            bool(update.get("lastChunk")),
+            update.get("append"),
+        ))
+    return frames
+
+
+def _status_states(payloads: list[dict]) -> list[str]:
+    return [
+        payload["statusUpdate"]["status"]["state"]
+        for payload in payloads
+        if isinstance(payload.get("statusUpdate"), dict)
+    ]
+
+
+class TestInboundStreamSnapshots:
+    def _run_loop(self, adapter):
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        adapter._loop = loop
+        adapter._message_handler = object()
+        return loop, thread
+
+    def _stop_loop(self, loop, thread):
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+
+    def _stream(self, adapter, handler, ctx: str, text: str = "stream me"):
+        params = {"message": protocol.text_message(protocol.ROLE_USER, text, context_id=ctx)}
+        adapter._rpc_message_stream(handler, "1", params, "peer")
+
+    def test_stream_replace_snapshot_waits_for_notify(self):
+        adapter = _bare_adapter()
+        loop, loop_thread = self._run_loop(adapter)
+        preview_sent = threading.Event()
+        release_final = threading.Event()
+
+        async def fake_handle(event):
+            await adapter.send(event.source.chat_id, "Hel", metadata={"expect_edits": True, "reply_to_message_id": event.message_id})
+            preview_sent.set()
+            assert release_final.wait(timeout=5)
+            await adapter.send(event.source.chat_id, "Hello", metadata={"notify": True, "reply_to_message_id": event.message_id})
+
+        adapter.handle_message = fake_handle  # type: ignore[method-assign]
+        handler = _SseCapture()
+        worker = threading.Thread(target=self._stream, args=(adapter, handler, "ctx-snap"), daemon=True)
+        try:
+            worker.start()
+            assert preview_sent.wait(timeout=5)
+            deadline = time.time() + 5
+            saw_preview = False
+            while time.time() < deadline:
+                frames = _artifact_frames(_sse_results(handler.raw()))
+                if any(text == "Hel" and append is False and not last for _aid, text, last, append in frames):
+                    saw_preview = True
+                    break
+                time.sleep(0.02)
+            assert saw_preview
+            assert worker.is_alive()
+            release_final.set()
+            worker.join(timeout=5)
+            assert not worker.is_alive()
+            frames = _artifact_frames(_sse_results(handler.raw()))
+            assert len({aid for aid, _text, _last, _append in frames}) == 1
+            assert frames[-1][1] == "Hello"
+            assert frames[-1][2] is True
+            assert all(append is False for _aid, _text, _last, append in frames)
+            assert "TASK_STATE_COMPLETED" in _status_states(_sse_results(handler.raw()))
+            merged = ""
+            for _aid, text, _last, append in frames:
+                assert append is False
+                merged = text
+            assert merged == "Hello"
+        finally:
+            release_final.set()
+            worker.join(timeout=2)
+            self._stop_loop(loop, loop_thread)
+
+    def test_interim_send_does_not_become_artifact(self):
+        adapter = _bare_adapter()
+        fut = adapter._add_pending("task-beat", "ctx-beat")
+        adapter.tasks.create("task-beat", "ctx-beat", "peer")
+
+        async def run():
+            beat = await adapter.send("ctx-beat", "⏳ Working — 3 min", metadata={"_interim_send": True})
+            assert beat.success is True
+            assert str(beat.message_id).startswith("a2a-status-")
+            assert fut.done() is False
+            edited = await adapter.edit_message("ctx-beat", beat.message_id, "⏳ Working — 4 min")
+            assert edited.success is True
+            stored = adapter.tasks.get("task-beat")
+            assert stored["artifact_text"] == ""
+
+        try:
+            asyncio.run(run())
+        finally:
+            adapter._pop_pending("task-beat")
+
+    def test_reply_to_targets_that_task_not_the_oldest(self):
+        adapter = _bare_adapter()
+        older = adapter._add_pending("task-old", "ctx-shared")
+        newer = adapter._add_pending("task-new", "ctx-shared")
+        adapter.tasks.create("task-old", "ctx-shared", "peer")
+        adapter.tasks.create("task-new", "ctx-shared", "peer")
+
+        async def run():
+            sent = await adapter.send(
+                "ctx-shared", "for newer",
+                metadata={"expect_edits": True, "reply_to_message_id": "task-new"},
+            )
+            assert sent.message_id == "task-new"
+            assert older.done() is False and newer.done() is False
+            assert adapter.tasks.get("task-new")["artifact_text"] == "for newer"
+            assert adapter.tasks.get("task-old")["artifact_text"] == ""
+
+        try:
+            asyncio.run(run())
+        finally:
+            adapter._pop_pending("task-old")
+            adapter._pop_pending("task-new")
+
+    def test_processing_complete_prefers_streamed_final_over_preview(self):
+        from gateway.platforms.event import ProcessingOutcome
+
+        adapter = _bare_adapter()
+        fut = adapter._add_pending("task-streamed", "ctx-streamed")
+        adapter.tasks.create("task-streamed", "ctx-streamed", "peer")
+        event = SimpleNamespace(message_id="task-streamed", _streamed_final_response="SSE_OK")
+
+        async def run():
+            await adapter.send(
+                "ctx-streamed", "partial",
+                metadata={"expect_edits": True, "reply_to_message_id": "task-streamed"},
+            )
+            await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+        try:
+            asyncio.run(run())
+            assert fut.result(timeout=0) == (protocol.STATE_COMPLETED, "SSE_OK")
+            assert adapter.tasks.get("task-streamed")["artifact_text"] == "SSE_OK"
+        finally:
+            adapter._pop_pending("task-streamed")
+
+    def test_subscribe_replays_current_snapshot(self):
+        adapter = _bare_adapter()
+        loop, loop_thread = self._run_loop(adapter)
+        preview_sent = threading.Event()
+        release_final = threading.Event()
+
+        async def fake_handle(event):
+            await adapter.send(
+                event.source.chat_id, "Hel",
+                metadata={"expect_edits": True, "reply_to_message_id": event.message_id},
+            )
+            preview_sent.set()
+            assert release_final.wait(timeout=5)
+            await adapter.send(
+                event.source.chat_id, "Hello",
+                metadata={"notify": True, "reply_to_message_id": event.message_id},
+            )
+
+        adapter.handle_message = fake_handle  # type: ignore[method-assign]
+        stream_handler = _SseCapture()
+        sub_handler = _SseCapture()
+        worker = threading.Thread(target=self._stream, args=(adapter, stream_handler, "ctx-sub"), daemon=True)
+        try:
+            worker.start()
+            assert preview_sent.wait(timeout=5)
+            deadline = time.time() + 5
+            task_id = ""
+            while time.time() < deadline and not task_id:
+                for record in adapter.tasks.list(context_id="ctx-sub")[0]:
+                    if record.get("artifact_text") == "Hel":
+                        task_id = record["task_id"]
+                time.sleep(0.02)
+            assert task_id
+            sub = threading.Thread(
+                target=adapter._rpc_tasks_subscribe,
+                args=(sub_handler, "2", {"taskId": task_id}),
+                daemon=True,
+            )
+            sub.start()
+            deadline = time.time() + 5
+            saw_replay = False
+            while time.time() < deadline:
+                if any(text == "Hel" for _aid, text, _last, _append in _artifact_frames(_sse_results(sub_handler.raw()))):
+                    saw_replay = True
+                    break
+                time.sleep(0.02)
+            assert saw_replay
+            assert sub.is_alive()
+            release_final.set()
+            worker.join(timeout=5)
+            sub.join(timeout=5)
+            frames = _artifact_frames(_sse_results(sub_handler.raw()))
+            assert frames[-1][1] == "Hello"
+            assert "TASK_STATE_COMPLETED" in _status_states(_sse_results(sub_handler.raw()))
+            got = adapter._rpc_tasks_get(3, {"taskId": task_id})
+            assert got["result"]["artifacts"][0]["artifactId"] == frames[-1][0]
+            assert protocol.extract_text(got["result"]["artifacts"][0]) == "Hello"
+        finally:
+            release_final.set()
+            worker.join(timeout=2)
+            self._stop_loop(loop, loop_thread)
+
+    def test_interim_stream_redacts_and_strips_cursor(self):
+        adapter = _bare_adapter()
+        loop, loop_thread = self._run_loop(adapter)
+        preview_sent = threading.Event()
+        release_final = threading.Event()
+        secret = "sk-abcdefghijklmnopqrstuvwxyz"
+
+        async def fake_handle(event):
+            await adapter.send(
+                event.source.chat_id, f"contact a@b.com then {secret} ▉",
+                metadata={"expect_edits": True, "reply_to_message_id": event.message_id},
+            )
+            preview_sent.set()
+            assert release_final.wait(timeout=5)
+            await adapter.send(
+                event.source.chat_id, "done",
+                metadata={"notify": True, "reply_to_message_id": event.message_id},
+            )
+
+        adapter.handle_message = fake_handle  # type: ignore[method-assign]
+        handler = _SseCapture()
+        worker = threading.Thread(target=self._stream, args=(adapter, handler, "ctx-redact"), daemon=True)
+        try:
+            worker.start()
+            assert preview_sent.wait(timeout=5)
+            deadline = time.time() + 5
+            snapshot = ""
+            while time.time() < deadline:
+                frames = _artifact_frames(_sse_results(handler.raw()))
+                if frames:
+                    snapshot = frames[0][1]
+                    break
+                time.sleep(0.02)
+            assert snapshot
+            assert secret not in snapshot
+            assert "a@b.com" not in snapshot
+            assert "▉" not in snapshot
+            release_final.set()
+            worker.join(timeout=5)
+        finally:
+            release_final.set()
+            worker.join(timeout=2)
+            self._stop_loop(loop, loop_thread)
+
+    def test_stream_failure_closes_without_notify(self):
+        from gateway.platforms.event import ProcessingOutcome
+
+        adapter = _bare_adapter()
+        loop, loop_thread = self._run_loop(adapter)
+
+        async def fake_handle(event):
+            await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+        adapter.handle_message = fake_handle  # type: ignore[method-assign]
+        handler = _SseCapture()
+        started = time.time()
+        try:
+            self._stream(adapter, handler, "ctx-fail")
+            assert time.time() - started < 30
+            assert "TASK_STATE_FAILED" in _status_states(_sse_results(handler.raw()))
+        finally:
+            self._stop_loop(loop, loop_thread)

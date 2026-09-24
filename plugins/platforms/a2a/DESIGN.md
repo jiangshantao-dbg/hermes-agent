@@ -50,10 +50,13 @@ Peers resolved from `config.yaml` → `a2a_agents`, or a direct URL.
 - **Live-session injection (the #11025 insight):** inbound tasks route through
   the normal `MessageEvent` → `handle_message` path keyed by the A2A
   `contextId`, so the agent that answers is the same one serving the user —
-  full memory/context, not a clone. The reply returns through `adapter.send()`,
-  which fulfils the pending per-**task** `Future` the HTTP request is blocked
-  on (per-context FIFO, so concurrent same-context requests can't cross-talk);
-  `on_processing_complete` resolves failures/cancellations promptly.
+  full memory/context, not a clone. `message/send` still waits on a per-task
+  `Future` resolved only by a notify-marked final `send`, or by
+  `on_processing_complete` when the gateway already streamed the body
+  (`_streamed_final_response`, #116944). `message/stream` and `tasks/subscribe`
+  fan out replace-snapshots (`append: false`, stable `artifactId`). Heartbeat
+  sends marked `_interim_send` are not artifacts. `tasks/get` shows the same
+  snapshot while the task is still WORKING.
 - **Task store:** every task (including terminal ones, bounded to the last
   500) stays queryable via `tasks/get` / `tasks/list`, and `tasks/subscribe`
   reattaches to a running task's stream via store watchers. A watchdog fails

@@ -21,8 +21,11 @@ from collections import deque
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FuturesTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from queue import Empty, Queue
 from typing import Any, Dict, Optional
+from uuid import uuid4
 
+from gateway.config import DEFAULT_STREAMING_CURSOR
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.config import Platform
@@ -291,9 +294,9 @@ class A2AAdapter(BasePlatformAdapter):
         self._profile_sessions: Dict[tuple[str, str, str], str] = {}
         self._profile_session_locks: Dict[tuple[str, str, str], threading.Lock] = {}
         self._profile_session_locks_guard = threading.Lock()
-        # Pending reply futures: task_id -> (context_id, Future). _pending_order keeps per-context
-        # FIFO so adapter.send() — which only knows the context — resolves the oldest task.
-        self._pending: Dict[str, tuple[str, Future]] = {}
+        # Pending replies: task_id -> {context_id, future, events subscribers, artifact_id, ...}.
+        # _pending_order 仍按 context FIFO，只在 send() 没有 reply_to_message_id 时兜底。
+        self._pending: Dict[str, dict] = {}
         self._pending_order: Dict[str, deque[str]] = {}
         # Request ownership outlives reply Futures and also covers synchronous profile forwards.
         self._active_tasks: set[str] = set()
@@ -475,11 +478,18 @@ class A2AAdapter(BasePlatformAdapter):
             logger.debug("A2A: tool registry unavailable for Agent Card", exc_info=True)
         return protocol.skills_from_toolsets(configured or [])
 
-    def _add_pending(self, task_id: str, context_id: str) -> Future:
+    def _add_pending(self, task_id: str, context_id: str, subscriber: Optional[Queue] = None) -> Future:
         fut: Future = Future()
         with self._pending_lock:
             self._active_tasks.add(task_id)
-            self._pending[task_id] = (context_id, fut)
+            self._pending[task_id] = {
+                "context_id": context_id,
+                "future": fut,
+                "subscribers": [subscriber] if subscriber is not None else [],
+                "artifact_id": uuid4().hex,
+                "streamed": False,
+                "last_text": "",
+            }
             self._pending_order.setdefault(context_id, deque()).append(task_id)
         return fut
 
@@ -491,26 +501,103 @@ class A2AAdapter(BasePlatformAdapter):
         with self._pending_lock:
             self._active_tasks.discard(task_id)
             entry = self._pending.pop(task_id, None)
-            order = self._pending_order.get(entry[0]) if entry else None
+            context_id = entry.get("context_id") if entry else None
+            order = self._pending_order.get(context_id) if context_id else None
             if order and task_id in order:
                 order.remove(task_id)
             if order is not None and not order:
-                self._pending_order.pop(entry[0], None)
+                self._pending_order.pop(context_id, None)
 
     def _resolve_locked(self, task_id: str, state: str, text: str) -> bool:
         entry = self._pending.get(task_id)
-        if not entry or entry[1].done():
+        if not entry or entry["future"].done():
             return False
-        entry[1].set_result((state, text))
+        entry["future"].set_result((state, text))
         return True
 
     def _resolve_task(self, task_id: str, state: str, text: str) -> bool:
         with self._pending_lock:
             return self._resolve_locked(task_id, state, text)
 
-    def _resolve_oldest_for_context(self, context_id: str, state: str, text: str) -> bool:
+    def _open_task_locked(self, task_id: str) -> bool:
+        rec = self._pending.get(task_id)
+        return bool(rec and not rec["future"].done())
+
+    def _oldest_open_task_locked(self, context_id: str) -> Optional[str]:
+        for tid in self._pending_order.get(context_id, ()):
+            if self._open_task_locked(tid):
+                return tid
+        return None
+
+    @staticmethod
+    def _is_answer_send(metadata: Optional[dict]) -> bool:
+        """只有真正的回答帧才进 artifact。
+
+        ``_interim_send`` 是 gateway 的心跳/状态标记，不是回答。
+        ``expect_edits`` 是流式预览，``notify`` 才是可以结束 JSON-RPC 等待的最终回复。
+        """
+        meta = metadata or {}
+        if meta.get("_interim_send"):
+            return False
+        return bool(meta.get("notify") or meta.get("expect_edits"))
+
+    def _select_task(self, chat_id: str, metadata: Optional[dict], *, message_id: str = "", allow_oldest: bool) -> Optional[str]:
+        """优先用 reply_to / message_id 命中具体 task，避免同一 context 上的 FIFO 串流。"""
+        meta = metadata or {}
+        hinted = str(message_id or meta.get("reply_to_message_id") or "").strip()
         with self._pending_lock:
-            return any(self._resolve_locked(tid, state, text) for tid in self._pending_order.get(context_id, ()))
+            if hinted and self._open_task_locked(hinted):
+                return hinted
+            if allow_oldest:
+                return self._oldest_open_task_locked(chat_id)
+        return None
+
+    @staticmethod
+    def _prepare_outbound_text(text: str) -> str:
+        raw = text or ""
+        cursor = DEFAULT_STREAMING_CURSOR
+        if cursor and raw.endswith(cursor):
+            raw = raw[: -len(cursor)]
+        raw = raw.replace("▉", "")
+        return security.redact_outbound(raw)
+
+    def _status_ack(self) -> SendResult:
+        """心跳和其它非回答 send 仍回成功，但 message_id 不能是 task id。"""
+        return SendResult(success=True, message_id=f"a2a-status-{uuid4().hex[:12]}")
+
+    def _attach_subscriber(self, task_id: str, events: Queue) -> bool:
+        with self._pending_lock:
+            rec = self._pending.get(task_id)
+            if not rec or rec["future"].done():
+                return False
+            rec["subscribers"].append(events)
+            return True
+
+    def _pending_stream_state(self, task_id: str) -> tuple[bool, str]:
+        with self._pending_lock:
+            rec = self._pending.get(task_id) or {}
+            return bool(rec.get("streamed")), str(rec.get("artifact_id") or "")
+
+    def _publish_artifact(self, task_id: str, text: str, *, last_chunk: bool = False) -> bool:
+        """向每条还活着的 SSE 订阅扇出一帧全文替换，并写入 TaskStore。"""
+        if not text:
+            return False
+        with self._pending_lock:
+            rec = self._pending.get(task_id)
+            if not rec or rec["future"].done():
+                return False
+            rec["streamed"] = True
+            rec["last_text"] = text
+            artifact_id = rec["artifact_id"]
+            context_id = rec["context_id"]
+            subscribers = list(rec["subscribers"])
+        self.tasks.set_artifact(task_id, artifact_id, text)
+        event = protocol.artifact_update(
+            task_id, context_id, text, artifact_id=artifact_id, last_chunk=last_chunk,
+        )
+        for subscriber in subscribers:
+            subscriber.put(event)
+        return True
 
     def _scope_for_agent(self, agent: Optional[dict]) -> tuple[str, str]:
         return tuple(str((agent or self._agents[""]).get(k) or "") for k in ("slug", "tenant"))
@@ -525,7 +612,7 @@ class A2AAdapter(BasePlatformAdapter):
         protocol.metrics.tasks_failed += state == protocol.STATE_FAILED
         return protocol.build_task(rec["task_id"], rec["context_id"], state, text, created_at=rec["created_iso"]), None
 
-    def _prepare_task(self, params: dict, peer: str, agent: Optional[dict] = None) -> tuple[Optional[dict], Optional[dict]]:
+    def _prepare_task(self, params: dict, peer: str, agent: Optional[dict] = None, subscriber: Optional[Queue] = None) -> tuple[Optional[dict], Optional[dict]]:
         """Validate, register, and dispatch an inbound message (HTTP worker thread). Returns
         (terminal_task, None) when it ends immediately, else (None, pending) with the future to wait on."""
         agent = agent or self._agents[""]
@@ -557,7 +644,7 @@ class A2AAdapter(BasePlatformAdapter):
                 self._pop_pending(task_id)
         if self._loop is None or self._message_handler is None:
             return self._end_task(rec, protocol.STATE_FAILED, "Agent gateway not ready to accept A2A tasks.")
-        fut = self._add_pending(task_id, context_id)
+        fut = self._add_pending(task_id, context_id, subscriber)
         event = MessageEvent(text=framed, message_type=MessageType.TEXT, message_id=task_id,
                              source=self.build_source(chat_id=context_id, chat_name=f"a2a:{peer}", chat_type="dm", user_id=peer, user_name=peer))
         try:
@@ -684,15 +771,58 @@ class A2AAdapter(BasePlatformAdapter):
     def _keepalive(cls, handler):
         return lambda: cls._sse_write(handler, ": keepalive\n\n")
 
-    def _emit_terminal(self, handler, task_id: str, context_id: str, state: str, reply: str, req_id: Any = None) -> None:
+    def _emit_terminal(self, handler, task_id: str, context_id: str, state: str, reply: str, req_id: Any = None, *, skip_artifact: bool = False, artifact_id: str = "") -> None:
         """Emit the final artifact/status events and the closure marker. ``req_id`` threads into the
-        JSON-RPC SSE envelope (§9.4)."""
+        JSON-RPC SSE envelope (§9.4). Skip the artifact when this stream already delivered the final replace-snapshot."""
         completed = bool(reply) and state == protocol.STATE_COMPLETED
-        events = ([protocol.artifact_update(task_id, context_id, reply)] if completed else []) + [
-            protocol.status_update(task_id, context_id, state, "" if completed else reply)]
+        events = []
+        if completed and not skip_artifact:
+            events.append(protocol.artifact_update(
+                task_id, context_id, reply, artifact_id=artifact_id, last_chunk=True,
+            ))
+        events.append(protocol.status_update(task_id, context_id, state, "" if completed else reply))
         for ev in events:
             self._sse_write(handler, protocol.sse_data(ev, req_id))
         self._sse_write(handler, protocol.sse_done())
+
+    def _pump_stream_events(self, handler, fut: Future, events: Queue, deadline: float, req_id: Any) -> tuple[str, str]:
+        """把队列里的 artifact 帧写进 SSE，直到 Future 完成且队列排空。
+
+        任务完成不会往队列里塞哨兵。若这里按 keepalive 间隔阻塞，订阅方会在
+        最后一帧已经写出后继续干等，流迟迟不关。完成态改为短轮询，keepalive 仍按间隔发。
+        """
+        timeout_result = (protocol.STATE_FAILED, "[agent did not reply in time]")
+        disconnected = (protocol.STATE_FAILED, "[client disconnected]")
+        last_keepalive = time.time()
+        while True:
+            if fut.done() and events.empty():
+                break
+            remaining = deadline - time.time()
+            if remaining <= 0 and not fut.done():
+                return timeout_result
+            try:
+                event = events.get(timeout=min(0.2, max(0.05, remaining)))
+            except Empty:
+                if fut.done():
+                    continue
+                now = time.time()
+                if now >= deadline:
+                    return timeout_result
+                if now - last_keepalive >= _SSE_KEEPALIVE:
+                    try:
+                        self._sse_write(handler, ": keepalive\n\n")
+                    except Exception:
+                        return disconnected
+                    last_keepalive = now
+                continue
+            try:
+                self._sse_write(handler, protocol.sse_data(event, req_id))
+            except Exception:
+                return disconnected
+        try:
+            return fut.result(timeout=0)
+        except Exception:
+            return timeout_result
 
     def _rpc_message_stream(self, handler, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None) -> None:
         """message/stream as an SSE response of JSON-RPC-wrapped StreamResponse events (§9.4)."""
@@ -700,7 +830,8 @@ class A2AAdapter(BasePlatformAdapter):
         self._sse_headers(handler)
         pending = None
         try:
-            terminal, pending = self._prepare_task(params, peer, agent=agent)
+            events: Queue = Queue()
+            terminal, pending = self._prepare_task(params, peer, agent=agent, subscriber=events)
             if terminal is not None:
                 return self._emit_terminal(handler, terminal["id"], terminal["contextId"], terminal["status"]["state"],
                                            protocol.extract_text(terminal.get("status", {}).get("message", {}) or {}), req_id=req_id)
@@ -708,9 +839,16 @@ class A2AAdapter(BasePlatformAdapter):
             submitted = protocol.build_task(task_id, context_id, protocol.STATE_SUBMITTED, created_at=pending["created_iso"])
             self._sse_write(handler, protocol.sse_data(protocol.stream_task(submitted), req_id))
             self._sse_write(handler, protocol.sse_data(protocol.status_update(task_id, context_id, protocol.STATE_WORKING), req_id))
-            state, reply = self._finalize_task(pending, *self._await_reply(pending, keepalive=self._keepalive(handler)))
+            state, reply = self._pump_stream_events(
+                handler, pending["future"], events, pending["started"] + _reply_timeout(), req_id,
+            )
+            streamed, artifact_id = self._pending_stream_state(task_id)
+            state, reply = self._finalize_task(pending, state, reply)
             pending = None
-            self._emit_terminal(handler, task_id, context_id, state, reply, req_id=req_id)
+            self._emit_terminal(
+                handler, task_id, context_id, state, reply, req_id=req_id,
+                skip_artifact=streamed, artifact_id=artifact_id,
+            )
         except (BrokenPipeError, ConnectionResetError):
             if pending is not None:
                 self._finalize_task(pending, protocol.STATE_FAILED, "[client disconnected]")
@@ -721,13 +859,40 @@ class A2AAdapter(BasePlatformAdapter):
         task_id, rec, error = self._find_task(req_id, params, agent)
         if error:
             return handler._json(200, error)
+        if rec["state"] in protocol.TERMINAL_STATES:
+            self._sse_headers(handler)
+            return self._emit_terminal(
+                handler, task_id, rec["context_id"], rec["state"], rec.get("reply") or "",
+                req_id=req_id, artifact_id=str(rec.get("artifact_id") or ""),
+            )
+        events: Queue = Queue()
+        # 后加入的订阅拿不到更早的帧；append=false 时回放当前全文即可对齐。
+        attached = self._attach_subscriber(task_id, events)
+        scope = self._scope_for_agent(agent)
         self._sse_headers(handler)
         try:
-            if (fut := self.tasks.watch(task_id, *self._scope_for_agent(agent))) is None:
+            if not attached:
+                fresh = self.tasks.get(task_id, *scope) or rec
+                return self._emit_terminal(
+                    handler, task_id, fresh["context_id"], fresh["state"], fresh.get("reply") or "",
+                    req_id=req_id, artifact_id=str(fresh.get("artifact_id") or ""),
+                )
+            current = self.tasks.get(task_id, *scope) or {}
+            if current.get("artifact_text"):
+                self._sse_write(handler, protocol.sse_data(protocol.artifact_update(
+                    task_id, current["context_id"], current["artifact_text"],
+                    artifact_id=str(current.get("artifact_id") or ""), last_chunk=False,
+                ), req_id))
+            fut = self.tasks.watch(task_id, *scope)
+            if fut is None:
                 return self._sse_write(handler, protocol.sse_done())
-            state, reply = self._await_future(fut, time.time() + _reply_timeout(), self._keepalive(handler),
-                                              (rec["state"], rec.get("reply", "")))
-            self._emit_terminal(handler, task_id, rec["context_id"], state, reply, req_id=req_id)
+            state, reply = self._pump_stream_events(handler, fut, events, time.time() + _reply_timeout(), req_id)
+            fresh = self.tasks.get(task_id, *scope) or {}
+            self._emit_terminal(
+                handler, task_id, fresh.get("context_id") or rec["context_id"], state, reply, req_id=req_id,
+                skip_artifact=bool(fresh.get("artifact_text")) and fresh.get("artifact_text") == reply,
+                artifact_id=str(fresh.get("artifact_id") or ""),
+            )
         except (BrokenPipeError, ConnectionResetError):
             logger.debug("A2A: subscribe client disconnected")
 
@@ -826,14 +991,47 @@ class A2AAdapter(BasePlatformAdapter):
         logger.debug("A2A: push notification sent for task %s", task_id)
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None):
-        """Fulfil the oldest pending reply Future for this context (``chat_id`` = A2A context id).
-        Only sends carrying ``metadata['notify']`` (the base adapter's final-reply marker) satisfy
-        the caller; progress/status/preview sends must not."""
-        if not (metadata or {}).get("notify"):
-            logger.debug("A2A: ignoring non-final send for context %s", chat_id)
-        elif not self._resolve_oldest_for_context(chat_id, protocol.STATE_COMPLETED, content or ""):
-            logger.debug("A2A: send() for context %s had no pending waiter", chat_id)  # late chunk / out-of-band
-        return SendResult(success=True, message_id=str(int(time.time() * 1000)))
+        """把回答帧写成 artifact 快照。只有 ``notify`` 结束等待中的 JSON-RPC Future。
+
+        心跳（``_interim_send``）和其它状态 send 不进 artifact。返回的 message_id 是 task id，
+        后续 ``edit_message`` 才能改到同一条 artifact，而不是 context 里最老的另一个任务。
+        """
+        text = self._prepare_outbound_text(content or "")
+        meta = dict(metadata or {})
+        if reply_to and not meta.get("reply_to_message_id"):
+            meta["reply_to_message_id"] = reply_to
+        if not self._is_answer_send(meta):
+            return self._status_ack()
+        task_id = self._select_task(chat_id, meta, allow_oldest=True)
+        if not task_id:
+            if meta.get("notify"):
+                logger.debug("A2A: send() for context %s had no pending waiter", chat_id)
+            return self._status_ack()
+        if meta.get("notify"):
+            self._publish_artifact(task_id, text, last_chunk=True)
+            if not self._resolve_task(task_id, protocol.STATE_COMPLETED, text):
+                logger.debug("A2A: send() for context %s had no pending waiter", chat_id)
+        else:
+            self._publish_artifact(task_id, text, last_chunk=False)
+        return SendResult(success=True, message_id=task_id)
+
+    async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
+        """流式编辑改的是同一条 artifact。``finalize`` 只表示这是当前预览的最后一帧，不在这里结束任务。
+
+        真正的最终文本可能在随后被抑制的 notify 里，或在 ``_streamed_final_response`` 里。
+        状态气泡的 message_id 以 ``a2a-status-`` 开头，编辑它不能碰到回答。
+        """
+        mid = str(message_id or "").strip()
+        if mid.startswith("a2a-status-"):
+            return SendResult(success=True, message_id=mid)
+        text = self._prepare_outbound_text(content or "")
+        task_id = self._select_task(chat_id, None, message_id=mid, allow_oldest=False)
+        if not task_id or not self._publish_artifact(task_id, text, last_chunk=False):
+            return SendResult(success=False, error="Not supported")
+        if finalize:
+            # 预览结束不等于任务结束。最终文本可能在被抑制的 notify，或 _streamed_final_response。
+            logger.debug("A2A: edit finalize for task %s left the JSON-RPC future open", task_id)
+        return SendResult(success=True, message_id=task_id)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         return None
@@ -846,15 +1044,25 @@ class A2AAdapter(BasePlatformAdapter):
         cancellations, empty runs, or a reply the gateway already streamed to the user) so the
         HTTP thread returns promptly."""
         task_id = str(getattr(event, "message_id", "") or "")
-        if task_id:
-            # A streamed turn never calls send() with notify=True (the gateway suppresses the
-            # normal final send once streaming delivered the body), so the SUCCESS default must
-            # not resolve with "" — that strands every A2A streaming reply as an empty completed
-            # task (#116944). _streamed_final_response is the same stash _final_text_for_post_turn_hooks
-            # reads for /goal and /loop.
-            _streamed = getattr(event, "_streamed_final_response", "")
-            default = (protocol.STATE_COMPLETED, _streamed if isinstance(_streamed, str) else "")
-            self._resolve_task(task_id, *{
-                ProcessingOutcome.FAILURE: (protocol.STATE_FAILED, "[agent processing failed]"),
-                ProcessingOutcome.CANCELLED: (protocol.STATE_CANCELED, ""),
-            }.get(outcome, default))
+        if not task_id:
+            return
+        if outcome == ProcessingOutcome.FAILURE:
+            self._resolve_task(task_id, protocol.STATE_FAILED, "[agent processing failed]")
+            return
+        if outcome == ProcessingOutcome.CANCELLED:
+            self._resolve_task(task_id, protocol.STATE_CANCELED, "")
+            return
+        # notify 已经结束的任务不能被成功收口覆盖。流式 turn 经常不再调用 notify
+        # （#116944），这时以 gateway 记下的 _streamed_final_response 为准，而不是最后一条预览。
+        with self._pending_lock:
+            rec = self._pending.get(task_id)
+            if not rec or rec["future"].done():
+                return
+            last_text = str(rec.get("last_text") or "")
+        stashed = getattr(event, "_streamed_final_response", "")
+        final = self._prepare_outbound_text(stashed) if isinstance(stashed, str) else ""
+        if not final:
+            final = last_text
+        if final:
+            self._publish_artifact(task_id, final, last_chunk=True)
+        self._resolve_task(task_id, protocol.STATE_COMPLETED, final)
