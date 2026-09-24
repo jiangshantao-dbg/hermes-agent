@@ -298,6 +298,8 @@ class A2AAdapter(BasePlatformAdapter):
         # _pending_order 仍按 context FIFO，只在 send() 没有 reply_to_message_id 时兜底。
         self._pending: Dict[str, dict] = {}
         self._pending_order: Dict[str, deque[str]] = {}
+        # 工具进度气泡的 message_id -> task_id。心跳 id 不登记，后续 edit 不能当成进度。
+        self._status_routes: Dict[str, str] = {}
         # Request ownership outlives reply Futures and also covers synchronous profile forwards.
         self._active_tasks: set[str] = set()
         self._pending_lock = threading.Lock()
@@ -507,6 +509,7 @@ class A2AAdapter(BasePlatformAdapter):
                 order.remove(task_id)
             if order is not None and not order:
                 self._pending_order.pop(context_id, None)
+            self._status_routes = {mid: tid for mid, tid in self._status_routes.items() if tid != task_id}
 
     def _resolve_locked(self, task_id: str, state: str, text: str) -> bool:
         entry = self._pending.get(task_id)
@@ -578,6 +581,44 @@ class A2AAdapter(BasePlatformAdapter):
             rec = self._pending.get(task_id) or {}
             return bool(rec.get("streamed")), str(rec.get("artifact_id") or "")
 
+    def _fanout(self, subscribers: list, events: list) -> None:
+        for subscriber in subscribers:
+            for event in events:
+                subscriber.put(event)
+
+    def _publish_progress(self, task_id: str, text: str) -> bool:
+        """工具进度同时走 statusUpdate 和一条独立 artifact。
+
+        回答 artifact 不能被进度覆盖，否则半成品回复会丢。单独的进度 artifact 让只看
+        artifact 的调用端也能在工具执行期间看到 “Reading skill ...”；status.message
+        则给只轮询任务状态的客户端。最终回答发出前会把这条进度 artifact 清空。
+        """
+        if not text:
+            return False
+        with self._pending_lock:
+            rec = self._pending.get(task_id)
+            if not rec or rec["future"].done():
+                return False
+            progress_id = str(rec.get("progress_artifact_id") or "") or uuid4().hex
+            rec["progress_artifact_id"] = progress_id
+            rec["progress_live"] = True
+            context_id = rec["context_id"]
+            subscribers = list(rec["subscribers"])
+        self.tasks.set_progress(task_id, progress_id, text)
+        self._fanout(subscribers, [
+            protocol.status_update(task_id, context_id, protocol.STATE_WORKING, text),
+            protocol.artifact_update(task_id, context_id, text, artifact_id=progress_id, last_chunk=False),
+        ])
+        return True
+
+    def _remember_status(self, message_id: str, task_id: str) -> None:
+        with self._pending_lock:
+            self._status_routes[message_id] = task_id
+
+    def _task_for_status(self, message_id: str) -> str:
+        with self._pending_lock:
+            return self._status_routes.get(message_id, "")
+
     def _publish_artifact(self, task_id: str, text: str, *, last_chunk: bool = False) -> bool:
         """向每条还活着的 SSE 订阅扇出一帧全文替换，并写入 TaskStore。"""
         if not text:
@@ -586,17 +627,29 @@ class A2AAdapter(BasePlatformAdapter):
             rec = self._pending.get(task_id)
             if not rec or rec["future"].done():
                 return False
+            # 最后一帧回答必须排在进度清空之后，调用端拼完所有 artifact 时只剩回答。
+            leading = []
+            if last_chunk and rec.get("progress_live"):
+                rec["progress_live"] = False
+                progress_id = str(rec.get("progress_artifact_id") or "")
+                if progress_id:
+                    leading.append(protocol.artifact_update(
+                        task_id, rec["context_id"], "", artifact_id=progress_id, last_chunk=False,
+                    ))
+            else:
+                progress_id = ""
             rec["streamed"] = True
             rec["last_text"] = text
             artifact_id = rec["artifact_id"]
             context_id = rec["context_id"]
             subscribers = list(rec["subscribers"])
+        if progress_id:
+            self.tasks.set_progress(task_id, progress_id, "")
         self.tasks.set_artifact(task_id, artifact_id, text)
         event = protocol.artifact_update(
             task_id, context_id, text, artifact_id=artifact_id, last_chunk=last_chunk,
         )
-        for subscriber in subscribers:
-            subscriber.put(event)
+        self._fanout(subscribers, [*leading, event])
         return True
 
     def _scope_for_agent(self, agent: Optional[dict]) -> tuple[str, str]:
@@ -878,6 +931,15 @@ class A2AAdapter(BasePlatformAdapter):
                     req_id=req_id, artifact_id=str(fresh.get("artifact_id") or ""),
                 )
             current = self.tasks.get(task_id, *scope) or {}
+            progress_text = str(current.get("progress_text") or "")
+            if progress_text:
+                self._sse_write(handler, protocol.sse_data(protocol.status_update(
+                    task_id, current["context_id"], protocol.STATE_WORKING, progress_text,
+                ), req_id))
+                self._sse_write(handler, protocol.sse_data(protocol.artifact_update(
+                    task_id, current["context_id"], progress_text,
+                    artifact_id=str(current.get("progress_artifact_id") or ""), last_chunk=False,
+                ), req_id))
             if current.get("artifact_text"):
                 self._sse_write(handler, protocol.sse_data(protocol.artifact_update(
                     task_id, current["context_id"], current["artifact_text"],
@@ -993,15 +1055,22 @@ class A2AAdapter(BasePlatformAdapter):
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None):
         """把回答帧写成 artifact 快照。只有 ``notify`` 结束等待中的 JSON-RPC Future。
 
-        心跳（``_interim_send``）和其它状态 send 不进 artifact。返回的 message_id 是 task id，
-        后续 ``edit_message`` 才能改到同一条 artifact，而不是 context 里最老的另一个任务。
+        工具进度走独立的进度 artifact 和 statusUpdate，不覆盖回答。心跳
+        （``_interim_send``）不进流。回答帧返回的 message_id 是 task id，后续
+        ``edit_message`` 才能改到同一条回答 artifact。
         """
         text = self._prepare_outbound_text(content or "")
         meta = dict(metadata or {})
         if reply_to and not meta.get("reply_to_message_id"):
             meta["reply_to_message_id"] = reply_to
         if not self._is_answer_send(meta):
-            return self._status_ack()
+            ack = self._status_ack()
+            # 心跳不是工具进度。进度气泡的后续 edit 只认这里登记过的 message_id。
+            if text and not meta.get("_interim_send"):
+                task_id = self._select_task(chat_id, meta, allow_oldest=True)
+                if task_id and self._publish_progress(task_id, text):
+                    self._remember_status(str(ack.message_id), task_id)
+            return ack
         task_id = self._select_task(chat_id, meta, allow_oldest=True)
         if not task_id:
             if meta.get("notify"):
@@ -1022,9 +1091,13 @@ class A2AAdapter(BasePlatformAdapter):
         状态气泡的 message_id 以 ``a2a-status-`` 开头，编辑它不能碰到回答。
         """
         mid = str(message_id or "").strip()
-        if mid.startswith("a2a-status-"):
-            return SendResult(success=True, message_id=mid)
         text = self._prepare_outbound_text(content or "")
+        if mid.startswith("a2a-status-"):
+            # 未登记的是心跳 id，编辑它不能把 “Working” 写进进度流。
+            task_id = self._task_for_status(mid)
+            if task_id and text:
+                self._publish_progress(task_id, text)
+            return SendResult(success=True, message_id=mid)
         task_id = self._select_task(chat_id, None, message_id=mid, allow_oldest=False)
         if not task_id or not self._publish_artifact(task_id, text, last_chunk=False):
             return SendResult(success=False, error="Not supported")

@@ -1859,6 +1859,47 @@ class TestInboundStreamSnapshots:
         finally:
             adapter._pop_pending("task-beat")
 
+    def test_tool_progress_streams_without_replacing_the_answer(self):
+        from queue import Queue
+
+        adapter = _bare_adapter()
+        events = Queue()
+        fut = adapter._add_pending("task-prog", "ctx-prog", subscriber=events)
+        adapter.tasks.create("task-prog", "ctx-prog", "peer")
+
+        async def run():
+            beat = await adapter.send("ctx-prog", "⏳ Working — 3 min", metadata={"_interim_send": True})
+            progress = await adapter.send("ctx-prog", "Reading skill pod-triage")
+            edited = await adapter.edit_message("ctx-prog", progress.message_id, "Reading skill pod-triage\nRunning kubectl")
+            assert beat.success and progress.success and edited.success
+            assert str(beat.message_id).startswith("a2a-status-")
+            assert fut.done() is False
+            stored = adapter.tasks.get("task-prog")
+            assert stored["artifact_text"] == ""
+            assert stored["progress_text"] == "Reading skill pod-triage\nRunning kubectl"
+            leaked = await adapter.edit_message("ctx-prog", beat.message_id, "⏳ Working — 4 min")
+            assert leaked.success is True
+            assert adapter.tasks.get("task-prog")["progress_text"] == "Reading skill pod-triage\nRunning kubectl"
+
+        try:
+            asyncio.run(run())
+            frames = []
+            while not events.empty():
+                frames.append(events.get_nowait())
+            progress_frames = [frame for frame in frames if "artifactUpdate" in frame]
+            assert progress_frames
+            assert protocol.extract_text(progress_frames[-1]["artifactUpdate"]["artifact"]) == "Reading skill pod-triage\nRunning kubectl"
+            assert any(
+                protocol.extract_text(frame["statusUpdate"]["status"]["message"]) == "Reading skill pod-triage"
+                for frame in frames if "statusUpdate" in frame
+            )
+            assert all("⏳ Working" not in json.dumps(frame) for frame in frames)
+            rendered = protocol.TaskStore.to_task(adapter.tasks.get("task-prog"))
+            assert protocol.extract_text(rendered["status"]["message"]) == "Reading skill pod-triage\nRunning kubectl"
+            assert any("Reading skill pod-triage" in protocol.extract_text(artifact) for artifact in rendered["artifacts"])
+        finally:
+            adapter._pop_pending("task-prog")
+
     def test_reply_to_targets_that_task_not_the_oldest(self):
         adapter = _bare_adapter()
         older = adapter._add_pending("task-old", "ctx-shared")
@@ -1961,6 +2002,57 @@ class TestInboundStreamSnapshots:
             got = adapter._rpc_tasks_get(3, {"taskId": task_id})
             assert got["result"]["artifacts"][0]["artifactId"] == frames[-1][0]
             assert protocol.extract_text(got["result"]["artifacts"][0]) == "Hello"
+        finally:
+            release_final.set()
+            worker.join(timeout=2)
+            self._stop_loop(loop, loop_thread)
+
+    def test_stream_emits_tool_progress_then_answer_only(self):
+        adapter = _bare_adapter()
+        loop, loop_thread = self._run_loop(adapter)
+        progress_sent = threading.Event()
+        release_final = threading.Event()
+
+        async def fake_handle(event):
+            await adapter.send(event.source.chat_id, "Reading skill pod-triage")
+            progress_sent.set()
+            assert release_final.wait(timeout=5)
+            await adapter.send(
+                event.source.chat_id, "final answer",
+                metadata={"notify": True, "reply_to_message_id": event.message_id},
+            )
+
+        adapter.handle_message = fake_handle  # type: ignore[method-assign]
+        handler = _SseCapture()
+        worker = threading.Thread(target=self._stream, args=(adapter, handler, "ctx-progress"), daemon=True)
+        try:
+            worker.start()
+            assert progress_sent.wait(timeout=5)
+            deadline = time.time() + 5
+            saw_progress = False
+            while time.time() < deadline:
+                payloads = _sse_results(handler.raw())
+                frames = _artifact_frames(payloads)
+                if any(text == "Reading skill pod-triage" and not last for _aid, text, last, _append in frames):
+                    saw_progress = True
+                    break
+                time.sleep(0.02)
+            assert saw_progress
+            assert worker.is_alive()
+            release_final.set()
+            worker.join(timeout=5)
+            frames = _artifact_frames(_sse_results(handler.raw()))
+            artifacts: dict[str, str] = {}
+            order: list[str] = []
+            for aid, text, _last, append in frames:
+                assert append is False
+                if aid not in artifacts:
+                    order.append(aid)
+                artifacts[aid] = text
+            joined = "\n\n".join(artifacts[aid] for aid in order if artifacts[aid])
+            assert joined == "final answer"
+            assert frames[-1][1] == "final answer"
+            assert frames[-1][2] is True
         finally:
             release_final.set()
             worker.join(timeout=2)

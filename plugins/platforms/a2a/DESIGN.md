@@ -54,9 +54,12 @@ Peers resolved from `config.yaml` → `a2a_agents`, or a direct URL.
   `Future` resolved only by a notify-marked final `send`, or by
   `on_processing_complete` when the gateway already streamed the body
   (`_streamed_final_response`, #116944). `message/stream` and `tasks/subscribe`
-  fan out replace-snapshots (`append: false`, stable `artifactId`). Heartbeat
-  sends marked `_interim_send` are not artifacts. `tasks/get` shows the same
-  snapshot while the task is still WORKING.
+  fan out replace-snapshots (`append: false`, stable `artifactId`). Tool-progress
+  sends (for example "Reading skill ...") go out as `statusUpdate` plus a
+  separate progress artifact, so they do not replace the answer snapshot.
+  Heartbeat sends marked `_interim_send` stay off the stream. The progress
+  artifact is cleared on the final answer frame. `tasks/get` shows the answer
+  snapshot and, while WORKING, the current progress text.
 - **Task store:** every task (including terminal ones, bounded to the last
   500) stays queryable via `tasks/get` / `tasks/list`, and `tasks/subscribe`
   reattaches to a running task's stream via store watchers. A watchdog fails

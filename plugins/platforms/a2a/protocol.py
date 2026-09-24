@@ -336,6 +336,7 @@ class TaskStore:
     def create(self, task_id: str, context_id: str, peer: str, agent_slug: str = "", tenant: str = "") -> dict:
         rec = {"task_id": task_id, "context_id": context_id, "peer": peer, "agent_slug": agent_slug or "", "tenant": tenant or "",
                "state": STATE_SUBMITTED, "reply": "", "artifact_id": "", "artifact_text": "",
+               "progress_artifact_id": "", "progress_text": "",
                "created_at": time.time(), "created_iso": now_iso(), "push_url": "", "push_config_id": ""}
         with self._lock:
             self._tasks[task_id] = rec
@@ -388,6 +389,15 @@ class TaskStore:
                 return
             rec["artifact_id"] = artifact_id
             rec["artifact_text"] = text
+
+    def set_progress(self, task_id: str, artifact_id: str, text: str) -> None:
+        """记录工具进度。和回答快照分开，避免 tasks/get 把过程文本当成回复。"""
+        with self._lock:
+            rec = self._tasks.get(task_id)
+            if not rec or rec["state"] in TERMINAL_STATES:
+                return
+            rec["progress_artifact_id"] = artifact_id
+            rec["progress_text"] = text
 
     def complete(self, task_id: str, state: str, reply: str = "") -> Optional[dict]:
         """Transition a task to a terminal state. Idempotent."""
@@ -450,18 +460,28 @@ class TaskStore:
     def to_task(rec: dict, include_artifacts: bool = True) -> dict:
         """Render a stored record as an A2A v1.0 Task.
 
-        终态的 status.message 仍是最终回复。进行中的全文只放在 artifact 上，
-        这样 tasks/get 能看到同一份替换快照，又不会把半成品说成已经完成。
+        终态的 status.message 仍是最终回复。进行中的回答全文在 artifact 上，
+        工具进度另放一条 artifact，并同时写进 status.message。
         """
         terminal = rec.get("state") in TERMINAL_STATES
         artifact_id = str(rec.get("artifact_id") or "")
         artifact_text = str(rec.get("artifact_text") or "")
+        progress_text = "" if terminal else str(rec.get("progress_text") or "")
         task = build_task(
-            rec["task_id"], rec["context_id"], rec["state"], rec.get("reply", "") if terminal else "",
+            rec["task_id"], rec["context_id"], rec["state"],
+            rec.get("reply", "") if terminal else progress_text,
             created_at=rec.get("created_iso", ""), artifact_id=artifact_id,
         )
+        artifacts = []
         if include_artifacts and artifact_text:
-            task["artifacts"] = [{"artifactId": artifact_id or uuid.uuid4().hex, "parts": [text_part(artifact_text)]}]
+            artifacts.append({"artifactId": artifact_id or uuid.uuid4().hex, "parts": [text_part(artifact_text)]})
+        if include_artifacts and progress_text:
+            artifacts.append({
+                "artifactId": str(rec.get("progress_artifact_id") or "") or uuid.uuid4().hex,
+                "parts": [text_part(progress_text)],
+            })
+        if artifacts:
+            task["artifacts"] = artifacts
         elif not include_artifacts:
             task.pop("artifacts", None)
         return task
